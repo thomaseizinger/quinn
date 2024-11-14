@@ -244,6 +244,13 @@ impl UdpSocketState {
             }
         }
 
+        if stride > len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("stride ({stride}) is greater than buffer len ({len})"),
+            ));
+        }
+
         meta[0] = RecvMeta {
             len: len as usize,
             stride: stride as usize,
