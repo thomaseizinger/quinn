@@ -51,6 +51,9 @@ impl<'a, M: MsgHdr> Encoder<'a, M> {
             self.len + space,
             self.hdr.control_len()
         );
+
+        dbg!(level, ty, space, self.hdr.control_len(), self.len);
+
         let cmsg = self.cmsg.take().expect("no control buffer space remaining");
         cmsg.set(
             level,
