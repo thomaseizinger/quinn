@@ -329,6 +329,9 @@ fn send(
         state.sendmsg_einval(),
     );
 
+    let len = transmit.contents.len();
+    let segment_len = transmit.segment_size;
+
     loop {
         let n = unsafe { libc::sendmsg(io.as_raw_fd(), &msg_hdr, 0) };
 
@@ -351,7 +354,7 @@ fn send(
                     // may already be in the pipeline, so we need to tolerate additional failures.
                     if state.max_gso_segments() > 1 {
                         crate::log::info!(
-                            "`libc::sendmsg` failed with {e}; halting segmentation offload"
+                            "`libc::sendmsg` failed to send message of len {len} with segment-size {segment_len:?} with {e}; halting segmentation offload"
                         );
                         state
                             .max_gso_segments
