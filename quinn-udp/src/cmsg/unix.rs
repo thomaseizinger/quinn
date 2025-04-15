@@ -48,10 +48,17 @@ impl MsgHdr for crate::imp::msghdr_x {
         // On MacOS < 14 CMSG_NXTHDR might continuously return a zeroed cmsg. In
         // such case, return a null pointer instead, thus indicating the end of
         // the cmsghdr chain.
-        if unsafe { next.as_ref() }
-            .is_some_and(|n| (n.cmsg_len as usize) < std::mem::size_of::<libc::cmsghdr>())
-        {
-            return std::ptr::null_mut();
+        if let Some(msg) = unsafe { next.as_ref() } {
+            let got_len = msg.cmsg_len as usize;
+            let want_len = std::mem::size_of::<libc::cmsghdr>();
+
+            if got_len < want_len {
+                crate::log::debug!(
+                    "CMSG_NXTHDR returned msg of size {got_len} but we wanted {want_len}"
+                );
+
+                return std::ptr::null_mut();
+            }
         }
 
         next
