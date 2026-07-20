@@ -33,8 +33,9 @@ use std::os::unix::io::AsFd;
 #[cfg(windows)]
 use std::os::windows::io::AsSocket;
 use std::{
-    io,
+    fmt, io,
     net::{IpAddr, Ipv6Addr, SocketAddr},
+    num::NonZeroUsize,
 };
 #[cfg(not(wasm_browser))]
 use std::{sync::Mutex, time::Instant};
@@ -159,28 +160,162 @@ pub struct Transmit<'a> {
     pub contents: &'a [u8],
     /// The segment size if this transmission contains multiple datagrams.
     /// This is `None` if the transmit only contains a single datagram
+    /// and must be non-zero when set.
     pub segment_size: Option<usize>,
     /// Optional source IP address for the datagram
     pub src_ip: Option<IpAddr>,
 }
 
-impl Transmit<'_> {
-    /// Computes the effective segment-size of the packet.
+impl<'a> Transmit<'a> {
+    /// Returns the number of datagrams encoded by this transmit.
     ///
-    /// Some (older) network drivers don't like being told to do GSO even if
-    /// there is effectively only a single segment.
-    /// (i.e. `segment_size == contents.len()`)
-    /// Additionally, a `segment_size` that is greater than the content also
-    /// means there is effectively only a single segment.
-    /// This case is actually quite common when splitting up a prepared GSO batch
-    /// again after GSO has been disabled because the last datagram in a GSO
-    /// batch is allowed to be smaller than the segment size.
-    #[cfg_attr(apple_fast, allow(dead_code))] // Used by prepare_msg, which is unused when apple_fast
-    fn effective_segment_size(&self) -> Option<usize> {
-        match self.segment_size? {
-            size if size >= self.contents.len() => None,
-            size => Some(size),
+    /// A transmit without a `segment_size` always represents one datagram, including when its
+    /// contents are empty.
+    pub fn datagram_count(&self) -> usize {
+        match self.segment_size {
+            Some(0) => panic!("segment size must be non-zero"),
+            Some(size) if size < self.contents.len() => self.contents.len().div_ceil(size),
+            Some(_) | None => 1,
         }
+    }
+
+    /// Advances past `datagrams` leading datagrams.
+    ///
+    /// This only adjusts the borrowed view of `contents`; it never copies packet data. The caller
+    /// must not use the transmit again after advancing by [`Self::datagram_count`] datagrams. This
+    /// caveat matters for empty UDP datagrams, for which there is no shorter slice that can encode
+    /// completion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `datagrams` exceeds [`Self::datagram_count`].
+    pub fn advance(&mut self, datagrams: impl Into<usize>) {
+        let datagrams = datagrams.into();
+        let total = self.datagram_count();
+        assert!(
+            datagrams <= total,
+            "cannot advance {datagrams} datagrams past a {total}-datagram transmit"
+        );
+
+        if datagrams == total {
+            self.contents = &self.contents[self.contents.len()..];
+            return;
+        }
+
+        let Some(segment_size) = self.segment_size else {
+            debug_assert_eq!(datagrams, 0);
+            return;
+        };
+        self.contents = &self.contents[datagrams * segment_size..];
+    }
+
+    /// Plans a send containing at most `max_datagrams.max(1)` leading datagrams.
+    #[cfg(not(wasm_browser))]
+    fn send_plan(&self, max_datagrams: usize) -> SendPlan<'_> {
+        let max_datagrams = max_datagrams.max(1);
+
+        let segment_size = self
+            .segment_size
+            .filter(|&size| size != 0 && size < self.contents.len());
+
+        let contents = match segment_size {
+            Some(size) => {
+                &self.contents[..self.contents.len().min(size.saturating_mul(max_datagrams))]
+            }
+            None => self.contents,
+        };
+
+        let datagram_count = match segment_size {
+            Some(size) => contents.len().div_ceil(size),
+            None => 1,
+        };
+        let segment_size = segment_size.filter(|&size| size < contents.len());
+
+        SendPlan {
+            transmit: self,
+            contents,
+            segment_size,
+            datagram_count,
+        }
+    }
+}
+
+/// The prefix of a [`Transmit`] attempted by one platform send operation.
+///
+/// Metadata remains borrowed from the original transmit. This only describes the payload view and
+/// segmentation parameters selected for the syscall.
+#[cfg(not(wasm_browser))]
+#[derive(Clone, Copy)]
+struct SendPlan<'a> {
+    transmit: &'a Transmit<'a>,
+    contents: &'a [u8],
+    segment_size: Option<usize>,
+    datagram_count: usize,
+}
+
+#[cfg(not(wasm_browser))]
+impl SendPlan<'_> {
+    fn destination(&self) -> SocketAddr {
+        self.transmit.destination
+    }
+
+    fn ecn(&self) -> Option<EcnCodepoint> {
+        self.transmit.ecn
+    }
+
+    fn src_ip(&self) -> Option<IpAddr> {
+        self.transmit.src_ip
+    }
+
+    #[cfg(any(apple, target_os = "linux", target_os = "android"))]
+    fn single(self) -> Self {
+        self.transmit.send_plan(1)
+    }
+}
+
+/// Number of leading datagrams consumed by a send operation.
+///
+/// Compare this with [`Transmit::datagram_count`] to determine whether the whole transmit was
+/// consumed. If it was not, pass it directly to [`Transmit::advance`] before retrying the
+/// remainder.
+#[must_use = "send progress must be handled by advancing or completing the transmit"]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct SendCount(NonZeroUsize);
+
+impl SendCount {
+    /// Constructs a send count, or returns `None` if `value` is zero.
+    pub fn new(value: usize) -> Option<Self> {
+        Some(Self(NonZeroUsize::new(value)?))
+    }
+
+    /// Returns the number of consumed datagrams.
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl From<SendCount> for usize {
+    fn from(value: SendCount) -> Self {
+        value.get()
+    }
+}
+
+impl PartialEq<usize> for SendCount {
+    fn eq(&self, other: &usize) -> bool {
+        self.get() == *other
+    }
+}
+
+impl PartialOrd<usize> for SendCount {
+    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
+        self.get().partial_cmp(other)
+    }
+}
+
+impl fmt::Display for SendCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
     }
 }
 
@@ -267,7 +402,7 @@ const IO_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
 fn log_sendmsg_error(
     last_send_error: &Mutex<Instant>,
     err: impl core::fmt::Debug,
-    transmit: &Transmit<'_>,
+    plan: &SendPlan<'_>,
 ) {
     let now = Instant::now();
     let last_send_error = &mut *last_send_error.lock().expect("poisend lock");
@@ -276,18 +411,18 @@ fn log_sendmsg_error(
         log::warn!(
             "sendmsg error: {:?}, Transmit: {{ destination: {:?}, src_ip: {:?}, ecn: {:?}, len: {:?}, segment_size: {:?} }}",
             err,
-            transmit.destination,
-            transmit.src_ip,
-            transmit.ecn,
-            transmit.contents.len(),
-            transmit.segment_size
+            plan.destination(),
+            plan.src_ip(),
+            plan.ecn(),
+            plan.contents.len(),
+            plan.segment_size
         );
     }
 }
 
 // No-op
 #[cfg(not(any(wasm_browser, feature = "tracing-log", feature = "log")))]
-fn log_sendmsg_error(_: &Mutex<Instant>, _: impl core::fmt::Debug, _: &Transmit<'_>) {}
+fn log_sendmsg_error(_: &Mutex<Instant>, _: impl core::fmt::Debug, _: &SendPlan<'_>) {}
 
 /// A borrowed UDP socket
 ///
@@ -351,27 +486,98 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effective_segment_size() {
+    fn send_plan_uses_effective_segment_size() {
         assert_eq!(
-            make_transmit(&[0u8; 10], Some(15)).effective_segment_size(),
+            make_transmit(&[0u8; 10], Some(15))
+                .send_plan(usize::MAX)
+                .segment_size,
             None,
             "segment_size > content_len should yield no effective segment_size"
         );
         assert_eq!(
-            make_transmit(&[0u8; 10], Some(10)).effective_segment_size(),
+            make_transmit(&[0u8; 10], Some(10))
+                .send_plan(usize::MAX)
+                .segment_size,
             None,
             "segment_size == content_len should yield no effective segment_size"
         );
         assert_eq!(
-            make_transmit(&[0u8; 10], None).effective_segment_size(),
+            make_transmit(&[0u8; 10], None)
+                .send_plan(usize::MAX)
+                .segment_size,
             None,
             "no segment_size should yield no effective segment_size"
         );
         assert_eq!(
-            make_transmit(&[0u8; 10], Some(5)).effective_segment_size(),
+            make_transmit(&[0u8; 10], Some(5))
+                .send_plan(usize::MAX)
+                .segment_size,
             Some(5),
             "segment_size < content_len should yield effective segment_size"
         );
+    }
+
+    #[test]
+    fn datagram_count_and_advance() {
+        let contents = [0u8; 11];
+        let mut transmit = make_transmit(&contents, Some(5));
+
+        assert!(SendCount::new(0).is_none());
+
+        assert_eq!(transmit.datagram_count(), 3);
+        let sent = SendCount::new(1).unwrap();
+        assert_eq!(sent, 1);
+        assert_eq!(sent.get(), 1);
+        transmit.advance(sent);
+        assert_eq!(transmit.contents.len(), 6);
+        assert_eq!(transmit.datagram_count(), 2);
+        transmit.advance(1usize);
+        assert_eq!(transmit.contents.len(), 1);
+        assert_eq!(transmit.datagram_count(), 1);
+        transmit.advance(1usize);
+        assert!(transmit.contents.is_empty());
+
+        assert_eq!(make_transmit(&[], None).datagram_count(), 1);
+        assert_eq!(make_transmit(&contents, None).datagram_count(), 1);
+        assert_eq!(make_transmit(&contents, Some(20)).datagram_count(), 1);
+    }
+
+    #[test]
+    fn send_plan_is_infallible_for_degenerate_limits_and_segment_sizes() {
+        let contents = [0u8; 11];
+
+        for segment_size in [None, Some(0)] {
+            let transmit = make_transmit(&contents, segment_size);
+            let plan = transmit.send_plan(0);
+
+            assert_eq!(plan.contents, contents);
+            assert_eq!(plan.datagram_count, 1);
+            assert_eq!(plan.segment_size, None);
+        }
+    }
+
+    #[test]
+    fn send_plan_preserves_a_datagram_prefix() {
+        let contents = [0u8; 11];
+        let transmit = make_transmit(&contents, Some(5));
+
+        let prefix = transmit.send_plan(2);
+        assert_eq!(prefix.contents.len(), 10);
+        assert_eq!(prefix.datagram_count, 2);
+        assert_eq!(prefix.segment_size, Some(5));
+        assert_eq!(prefix.destination(), transmit.destination);
+        assert_eq!(prefix.ecn(), transmit.ecn);
+        assert_eq!(prefix.src_ip(), transmit.src_ip);
+
+        let complete = transmit.send_plan(3);
+        assert_eq!(complete.contents.len(), 11);
+        assert_eq!(complete.datagram_count, 3);
+        assert_eq!(complete.segment_size, Some(5));
+
+        let single = prefix.single();
+        assert_eq!(single.contents.len(), 5);
+        assert_eq!(single.datagram_count, 1);
+        assert_eq!(single.segment_size, None);
     }
 
     fn make_transmit(contents: &[u8], segment_size: Option<usize>) -> Transmit<'_> {

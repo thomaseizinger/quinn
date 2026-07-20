@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use super::{IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, log_sendmsg_error};
+use super::{IO_ERROR_LOG_INTERVAL, RecvMeta, SendPlan, Transmit, UdpSockRef, log_sendmsg_error};
 
 /// Fallback UDP socket interface that stubs out all special functionality
 ///
@@ -36,20 +36,24 @@ impl UdpSocketState {
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(socket, transmit) {
-            Ok(()) => Ok(()),
+        let plan = transmit.send_plan(1);
+
+        match send(socket, plan) {
+            Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             Err(e) => {
-                log_sendmsg_error(&self.last_send_error, e, transmit);
+                log_sendmsg_error(&self.last_send_error, e, &plan);
 
                 Ok(())
             }
         }
     }
 
-    /// Sends a [`Transmit`] on the given socket without any additional error handling.
+    /// Sends the first datagram of a [`Transmit`] without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(socket, transmit)
+        send(socket, transmit.send_plan(1))?;
+
+        Ok(())
     }
 
     pub fn recv(
@@ -117,11 +121,22 @@ impl UdpSocketState {
     }
 }
 
-fn send(socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-    socket.0.send_to(
-        transmit.contents,
-        &socket2::SockAddr::from(transmit.destination),
-    )
+fn send(socket: UdpSockRef<'_>, plan: SendPlan<'_>) -> io::Result<usize> {
+    let sent = socket
+        .0
+        .send_to(plan.contents, &socket2::SockAddr::from(plan.destination()))?;
+
+    if sent != plan.contents.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!(
+                "send_to accepted {sent} of {} bytes from an atomic UDP send",
+                plan.contents.len()
+            ),
+        ));
+    }
+
+    Ok(plan.datagram_count)
 }
 
 pub(crate) const BATCH_SIZE: usize = 1;

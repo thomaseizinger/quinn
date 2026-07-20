@@ -15,7 +15,7 @@ use libc::{c_int, c_uint};
 use windows_sys::Win32::Networking::WinSock;
 
 use crate::{
-    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef,
+    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, SendPlan, Transmit, UdpSockRef,
     cmsg::{self, CMsgHdr},
     log::debug,
     log_sendmsg_error,
@@ -197,30 +197,29 @@ impl UdpSocketState {
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(
-            socket,
-            transmit,
-            self.ecn_v4_supported,
-            self.ecn_v6_supported,
-        ) {
-            Ok(()) => Ok(()),
+        let plan = transmit.send_plan(self.max_gso_segments());
+
+        match send(socket, plan, self.ecn_v4_supported, self.ecn_v6_supported) {
+            Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             Err(e) => {
-                log_sendmsg_error(&self.last_send_error, e, transmit);
+                log_sendmsg_error(&self.last_send_error, e, &plan);
 
                 Ok(())
             }
         }
     }
 
-    /// Sends a [`Transmit`] on the given socket without any additional error handling.
+    /// Sends a prefix of a [`Transmit`] without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
         send(
             socket,
-            transmit,
+            transmit.send_plan(self.max_gso_segments()),
             self.ecn_v4_supported,
             self.ecn_v6_supported,
-        )
+        )?;
+
+        Ok(())
     }
 
     pub fn recv(
@@ -383,18 +382,18 @@ impl UdpSocketState {
 
 fn send(
     socket: UdpSockRef<'_>,
-    transmit: &Transmit<'_>,
+    plan: SendPlan<'_>,
     ecn_v4_supported: bool,
     ecn_v6_supported: bool,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     // we cannot use [`socket2::sendmsg()`] and [`socket2::MsgHdr`] as we do not have access
     // to the inner field which holds the WSAMSG
     let mut ctrl_buf = cmsg::Aligned([0; CMSG_LEN]);
-    let daddr = socket2::SockAddr::from(transmit.destination);
+    let daddr = socket2::SockAddr::from(plan.destination());
 
     let mut data = WinSock::WSABUF {
-        buf: transmit.contents.as_ptr() as *mut _,
-        len: transmit.contents.len() as _,
+        buf: plan.contents.as_ptr() as *mut _,
+        len: plan.contents.len() as _,
     };
 
     let ctrl = WinSock::WSABUF {
@@ -414,7 +413,7 @@ fn send(
     // Add control messages (ECN and PKTINFO)
     let mut encoder = unsafe { cmsg::Encoder::new(&mut wsa_msg) };
 
-    if let Some(ip) = transmit.src_ip {
+    if let Some(ip) = plan.src_ip() {
         let ip = std::net::SocketAddr::new(ip, 0);
         let ip = socket2::SockAddr::from(ip);
         match ip.family() {
@@ -441,12 +440,13 @@ fn send(
     }
 
     // True for IPv4 or IPv4-Mapped IPv6
-    let is_ipv4 = transmit.destination.is_ipv4()
-        || matches!(transmit.destination.ip(), IpAddr::V6(addr) if addr.to_ipv4_mapped().is_some());
+    let destination = plan.destination();
+    let is_ipv4 = destination.is_ipv4()
+        || matches!(destination.ip(), IpAddr::V6(addr) if addr.to_ipv4_mapped().is_some());
 
     if (is_ipv4 && ecn_v4_supported) || (!is_ipv4 && ecn_v6_supported) {
         // ECN is a C integer https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-ecn
-        let ecn = transmit.ecn.map_or(0, |x| x as c_int);
+        let ecn = plan.ecn().map_or(0, |x| x as c_int);
         if is_ipv4 {
             encoder.push(WinSock::IPPROTO_IP, WinSock::IP_ECN, ecn);
         } else {
@@ -455,7 +455,7 @@ fn send(
     }
 
     // Segment size is a u32 https://learn.microsoft.com/en-us/windows/win32/api/ws2tcpip/nf-ws2tcpip-wsasetudpsendmessagesize
-    if let Some(segment_size) = transmit.effective_segment_size() {
+    if let Some(segment_size) = plan.segment_size {
         encoder.push(
             WinSock::IPPROTO_UDP,
             WinSock::UDP_SEND_MSG_SIZE,
@@ -478,7 +478,14 @@ fn send(
     };
 
     match rc {
-        0 => Ok(()),
+        0 if len as usize == plan.contents.len() => Ok(plan.datagram_count),
+        0 => Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!(
+                "WSASendMsg accepted {len} of {} bytes from an atomic UDP send",
+                plan.contents.len()
+            ),
+        )),
         _ => Err(io::Error::last_os_error()),
     }
 }
