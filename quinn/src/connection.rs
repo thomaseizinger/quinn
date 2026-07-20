@@ -1014,8 +1014,23 @@ pub(crate) struct State {
     sender: Pin<Box<dyn UdpSender>>,
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
-    /// We buffer a transmit when the underlying I/O would block
-    buffered_transmit: Option<proto::Transmit>,
+    /// We buffer a transmit when the underlying I/O would block or accepts only a prefix.
+    buffered_transmit: Option<BufferedTransmit>,
+}
+
+struct BufferedTransmit {
+    transmit: proto::Transmit,
+    /// Byte offset of the first datagram not yet accepted by the UDP socket.
+    offset: usize,
+}
+
+impl BufferedTransmit {
+    fn new(transmit: proto::Transmit) -> Self {
+        Self {
+            transmit,
+            offset: 0,
+        }
+    }
 }
 
 impl State {
@@ -1062,7 +1077,7 @@ impl State {
 
         loop {
             // Retry the last transmit, or get a new one.
-            let t = match self.buffered_transmit.take() {
+            let mut buffered = match self.buffered_transmit.take() {
                 Some(t) => t,
                 None => {
                     self.send_buffer.clear();
@@ -1076,25 +1091,42 @@ impl State {
                                 None => 1,
                                 Some(s) => t.size.div_ceil(s), // round up
                             };
-                            t
+                            BufferedTransmit::new(t)
                         }
                         None => break,
                     }
                 }
             };
 
-            let len = t.size;
-            match self
-                .sender
-                .as_mut()
-                .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
-            {
+            let len = buffered.transmit.size;
+            let mut transmit =
+                udp_transmit(&buffered.transmit, &self.send_buffer[buffered.offset..len]);
+            let remaining_datagrams = transmit.datagram_count();
+
+            match self.sender.as_mut().poll_send(&transmit, cx) {
                 Poll::Pending => {
-                    self.buffered_transmit = Some(t);
+                    self.buffered_transmit = Some(buffered);
                     return Ok(false);
                 }
                 Poll::Ready(Err(e)) => return Err(e),
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(sent)) => {
+                    if sent == 0 || sent > remaining_datagrams {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "UDP sender accepted {sent} datagrams from a {remaining_datagrams}-datagram transmit"
+                            ),
+                        ));
+                    }
+
+                    if sent < remaining_datagrams {
+                        let previous_len = transmit.contents.len();
+                        transmit.advance(sent);
+                        buffered.offset += previous_len - transmit.contents.len();
+                        self.buffered_transmit = Some(buffered);
+                        continue;
+                    }
+                }
             }
 
             if transmits >= MAX_TRANSMIT_DATAGRAMS {
