@@ -289,6 +289,11 @@ impl SendCount {
         Some(Self(NonZeroUsize::new(value)?))
     }
 
+    #[cfg(not(wasm_browser))]
+    fn from_datagram_count(value: usize) -> Self {
+        Self::new(value).expect("a send operation must consume at least one datagram")
+    }
+
     /// Returns the number of consumed datagrams.
     pub const fn get(self) -> usize {
         self.0.get()

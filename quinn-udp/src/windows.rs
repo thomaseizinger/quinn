@@ -15,7 +15,7 @@ use libc::{c_int, c_uint};
 use windows_sys::Win32::Networking::WinSock;
 
 use crate::{
-    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, SendPlan, Transmit, UdpSockRef,
+    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, SendCount, SendPlan, Transmit, UdpSockRef,
     cmsg::{self, CMsgHdr},
     log::debug,
     log_sendmsg_error,
@@ -190,36 +190,49 @@ impl UdpSocketState {
     /// This function will only ever return errors of kind [`io::ErrorKind::WouldBlock`].
     /// All other errors will be logged and converted to `Ok`.
     ///
+    /// The return value is the number of leading datagrams consumed. When any error other than
+    /// [`io::ErrorKind::WouldBlock`] is suppressed, the attempted datagrams are reported as
+    /// consumed and treated as lost, consistent with this method's best-effort semantics.
+    ///
     /// UDP transmission errors are considered non-fatal because higher-level protocols must
     /// employ retransmits and timeouts anyway in order to deal with UDP's unreliable nature.
     /// Thus, logging is most likely the only thing you can do with these errors.
     ///
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
-    pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
+    pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<SendCount> {
         let plan = transmit.send_plan(self.max_gso_segments());
+        let attempted = plan.datagram_count;
 
         match send(socket, plan, self.ecn_v4_supported, self.ecn_v6_supported) {
-            Ok(_) => Ok(()),
+            Ok(sent) => Ok(SendCount::from_datagram_count(sent)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             Err(e) => {
                 log_sendmsg_error(&self.last_send_error, e, &plan);
 
-                Ok(())
+                Ok(SendCount::from_datagram_count(attempted))
             }
         }
     }
 
     /// Sends a prefix of a [`Transmit`] without any additional error handling.
-    pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(
+    ///
+    /// Returns the number of leading datagrams accepted by the kernel. The prefix is limited to
+    /// the platform's current segmentation capacity; callers should use [`Transmit::advance`] and
+    /// retry any remainder.
+    pub fn try_send(
+        &self,
+        socket: UdpSockRef<'_>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<SendCount> {
+        let sent = send(
             socket,
             transmit.send_plan(self.max_gso_segments()),
             self.ecn_v4_supported,
             self.ecn_v6_supported,
         )?;
 
-        Ok(())
+        Ok(SendCount::from_datagram_count(sent))
     }
 
     pub fn recv(

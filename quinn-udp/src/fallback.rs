@@ -4,7 +4,9 @@ use std::{
     time::Instant,
 };
 
-use super::{IO_ERROR_LOG_INTERVAL, RecvMeta, SendPlan, Transmit, UdpSockRef, log_sendmsg_error};
+use super::{
+    IO_ERROR_LOG_INTERVAL, RecvMeta, SendCount, SendPlan, Transmit, UdpSockRef, log_sendmsg_error,
+};
 
 /// Fallback UDP socket interface that stubs out all special functionality
 ///
@@ -29,31 +31,42 @@ impl UdpSocketState {
     /// This function will only ever return errors of kind [`io::ErrorKind::WouldBlock`].
     /// All other errors will be logged and converted to `Ok`.
     ///
+    /// The return value is the number of leading datagrams consumed. When any error other than
+    /// [`io::ErrorKind::WouldBlock`] is suppressed, the attempted datagram is reported as consumed
+    /// and treated as lost, consistent with this method's best-effort semantics.
+    ///
     /// UDP transmission errors are considered non-fatal because higher-level protocols must
     /// employ retransmits and timeouts anyway in order to deal with UDP's unreliable nature.
     /// Thus, logging is most likely the only thing you can do with these errors.
     ///
     /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
     /// instead.
-    pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
+    pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<SendCount> {
         let plan = transmit.send_plan(1);
 
         match send(socket, plan) {
-            Ok(_) => Ok(()),
+            Ok(sent) => Ok(SendCount::from_datagram_count(sent)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             Err(e) => {
                 log_sendmsg_error(&self.last_send_error, e, &plan);
 
-                Ok(())
+                Ok(SendCount::from_datagram_count(1))
             }
         }
     }
 
     /// Sends the first datagram of a [`Transmit`] without any additional error handling.
-    pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        send(socket, transmit.send_plan(1))?;
+    ///
+    /// Returns `1` when the datagram is accepted by the kernel. Callers should use
+    /// [`Transmit::advance`] and retry any remainder.
+    pub fn try_send(
+        &self,
+        socket: UdpSockRef<'_>,
+        transmit: &Transmit<'_>,
+    ) -> io::Result<SendCount> {
+        let sent = send(socket, transmit.send_plan(1))?;
 
-        Ok(())
+        Ok(SendCount::from_datagram_count(sent))
     }
 
     pub fn recv(
