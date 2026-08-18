@@ -176,7 +176,7 @@ impl Endpoint {
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
-                    tracing::error!("I/O error: {}", e);
+                    tracing::error!(error = %e, "I/O error");
                 }
             }
             .instrument(Span::current()),

@@ -228,13 +228,13 @@ fn log_sendmsg_error(
     *last_send_error = Some(now);
 
     tracing::warn!(
-        "sendmsg error: {:?}, Transmit: {{ destination: {:?}, src_ip: {:?}, ecn: {:?}, len: {:?}, segment_size: {:?} }}",
-        error,
-        transmit.destination,
-        transmit.src_ip,
-        transmit.ecn,
-        transmit.contents.len(),
-        transmit.segment_size
+        error = ?error,
+        destination = %transmit.destination,
+        src_ip = ?transmit.src_ip,
+        ecn = ?transmit.ecn,
+        len = transmit.contents.len(),
+        segment_size = ?transmit.segment_size,
+        "sendmsg error"
     );
 }
 

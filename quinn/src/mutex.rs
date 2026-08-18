@@ -52,8 +52,10 @@ mod tracking {
 
             if elapsed > Duration::from_millis(1) {
                 warn!(
-                    "Locking the connection for {} took {:?}. Last owners: {:?}",
-                    purpose, elapsed, guard.last_lock_owner
+                    purpose,
+                    ?elapsed,
+                    last_owners = ?guard.last_lock_owner,
+                    "locking the connection took too long"
                 );
             }
 
@@ -81,8 +83,9 @@ mod tracking {
 
             if duration > Duration::from_millis(1) {
                 warn!(
-                    "Utilizing the connection for {} took {:?}",
-                    self.purpose, duration
+                    purpose = self.purpose,
+                    ?duration,
+                    "utilizing the connection took too long"
                 );
             }
 
