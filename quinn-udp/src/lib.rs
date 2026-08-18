@@ -66,7 +66,35 @@ mod imp;
 #[allow(unused_imports, unused_macros)]
 mod log {
     #[cfg(all(feature = "log", not(feature = "tracing-log")))]
-    pub(crate) use log::{debug, error, info, trace, warn};
+    mod log_backend {
+        macro_rules! log_warn {
+            (@fields [$($fields:tt)*] $field:ident = ? $value:expr, $($rest:tt)*) => {
+                $crate::log::log_warn!(@fields [$($fields)*, $field:? = $value] $($rest)*)
+            };
+            (@fields [$($fields:tt)*] $field:ident = % $value:expr, $($rest:tt)*) => {
+                $crate::log::log_warn!(@fields [$($fields)*, $field:% = $value] $($rest)*)
+            };
+            (@fields [$($fields:tt)*] $field:ident = $value:expr, $($rest:tt)*) => {
+                $crate::log::log_warn!(@fields [$($fields)*, $field = $value] $($rest)*)
+            };
+            (@fields [, $($fields:tt)*] $message:literal $(,)?) => {
+                ::log::warn!($($fields)*; $message)
+            };
+            ($field:ident = $($rest:tt)*) => {
+                $crate::log::log_warn!(@fields [] $field = $($rest)*)
+            };
+            ($($tt:tt)*) => {
+                ::log::warn!($($tt)*)
+            };
+        }
+
+        pub(crate) use log_warn;
+    }
+
+    #[cfg(all(feature = "log", not(feature = "tracing-log")))]
+    pub(crate) use ::log::{debug, error, info, trace};
+    #[cfg(all(feature = "log", not(feature = "tracing-log")))]
+    pub(crate) use log_backend::{log_warn, log_warn as warn};
 
     #[cfg(feature = "tracing-log")]
     pub(crate) use tracing::{debug, error, info, trace, warn};
@@ -273,24 +301,13 @@ fn log_sendmsg_error(
     let last_send_error = &mut *last_send_error.lock().expect("poisend lock");
     if now.saturating_duration_since(*last_send_error) > IO_ERROR_LOG_INTERVAL {
         *last_send_error = now;
-        #[cfg(feature = "tracing-log")]
-        tracing::warn!(
+        log::warn!(
             error = ?err,
             destination = %transmit.destination,
             src_ip = ?transmit.src_ip,
             ecn = ?transmit.ecn,
             len = transmit.contents.len(),
             segment_size = ?transmit.segment_size,
-            "sendmsg error"
-        );
-        #[cfg(all(feature = "log", not(feature = "tracing-log")))]
-        log::warn!(
-            error:? = err,
-            destination:% = transmit.destination,
-            src_ip:? = transmit.src_ip,
-            ecn:? = transmit.ecn,
-            len = transmit.contents.len(),
-            segment_size:? = transmit.segment_size;
             "sendmsg error"
         );
     }
