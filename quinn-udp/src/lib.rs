@@ -285,13 +285,13 @@ fn log_sendmsg_error(
         );
         #[cfg(all(feature = "log", not(feature = "tracing-log")))]
         log::warn!(
-            "sendmsg error: {:?}, Transmit: {{ destination: {:?}, src_ip: {:?}, ecn: {:?}, len: {:?}, segment_size: {:?} }}",
-            err,
-            transmit.destination,
-            transmit.src_ip,
-            transmit.ecn,
-            transmit.contents.len(),
-            transmit.segment_size
+            error:? = err,
+            destination:% = transmit.destination,
+            src_ip:? = transmit.src_ip,
+            ecn:? = transmit.ecn,
+            len = transmit.contents.len(),
+            segment_size:? = transmit.segment_size;
+            "sendmsg error"
         );
     }
 }
