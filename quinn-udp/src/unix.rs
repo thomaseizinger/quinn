@@ -31,6 +31,8 @@ use super::linux::{LinuxError, gso};
 #[derive(Debug)]
 pub struct UdpSocketState {
     last_send_error: Mutex<Instant>,
+    #[cfg(interface_debug)]
+    interface_binding_logged: std::sync::Once,
     max_gso_segments: AtomicUsize,
     gro_segments: usize,
     may_fragment: bool,
@@ -198,6 +200,8 @@ impl UdpSocketState {
         let now = Instant::now();
         Ok(Self {
             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
+            #[cfg(interface_debug)]
+            interface_binding_logged: std::sync::Once::new(),
             max_gso_segments: AtomicUsize::new(gso::max_gso_segments(&*io)),
             gro_segments,
             may_fragment,
@@ -222,7 +226,7 @@ impl UdpSocketState {
     /// instead.
     #[deprecated(note = "silences I/O errors; use `UdpSocketState::try_send() instead")]
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(self, socket.0, transmit) {
+        match self.try_send(socket, transmit) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid
@@ -238,6 +242,12 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
+        #[cfg(interface_debug)]
+        self.interface_binding_logged.call_once(|| {
+            if crate::log::enabled!(crate::log::DEBUG) {
+                log_bound_interface(&socket);
+            }
+        });
         send(self, socket.0, transmit)
     }
 
@@ -966,6 +976,69 @@ mod gso {
         #[cfg(apple_fast)] _encoder: &mut cmsg::Encoder<'_, msghdr_x>,
         _segment_size: u16,
     ) {
+    }
+}
+
+#[cfg(interface_debug)]
+fn log_bound_interface(socket: &UdpSockRef<'_>) {
+    #[cfg(apple)]
+    {
+        let mut interfaces = [None; 2];
+        for (slot, level, option) in [
+            (0, libc::IPPROTO_IP, libc::IP_BOUND_IF),
+            (1, libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF),
+        ] {
+            let mut index = 0_u32;
+            let mut length = size_of_val(&index) as libc::socklen_t;
+            // SAFETY: both output pointers refer to writable storage of the supplied size.
+            if unsafe {
+                libc::getsockopt(
+                    socket.0.as_raw_fd(),
+                    level,
+                    option,
+                    (&mut index as *mut u32).cast(),
+                    &mut length,
+                )
+            } == 0
+                && index != 0
+            {
+                interfaces[slot] = Some(index);
+            }
+        }
+        if interfaces != [None; 2] {
+            crate::log::debug!(
+                "UDP socket {} ({:?}) has interface constraints: IPv4={:?}, IPv6={:?}",
+                socket.0.as_raw_fd(),
+                socket.0.local_addr().ok().and_then(|a| a.as_socket()),
+                interfaces[0],
+                interfaces[1],
+            );
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut name = [0_u8; libc::IFNAMSIZ];
+        let mut length = name.len() as libc::socklen_t;
+        // SAFETY: both output pointers refer to writable storage of the supplied size.
+        if unsafe {
+            libc::getsockopt(
+                socket.0.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name.as_mut_ptr().cast(),
+                &mut length,
+            )
+        } == 0
+            && name[0] != 0
+            && let Ok(name) = std::ffi::CStr::from_bytes_until_nul(&name)
+        {
+            crate::log::debug!(
+                "UDP socket {} ({:?}) is bound to interface {}",
+                socket.0.as_raw_fd(),
+                socket.0.local_addr().ok().and_then(|a| a.as_socket()),
+                name.to_string_lossy(),
+            );
+        }
     }
 }
 

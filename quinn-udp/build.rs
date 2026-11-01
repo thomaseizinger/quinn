@@ -26,6 +26,12 @@ fn main() {
                 target_os = "illumos"
             )
         },
+        interface_debug: {
+            all(
+                any(feature = "log", feature = "tracing-log"),
+                any(apple, windows, target_os = "linux", target_os = "android")
+            )
+        },
         // Convenience aliases
         apple_fast: { all(apple, feature = "fast-apple-datapath") },
         apple_slow: { all(apple, not(feature = "fast-apple-datapath")) },

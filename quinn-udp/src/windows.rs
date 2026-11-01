@@ -27,6 +27,8 @@ use crate::{
 #[derive(Debug)]
 pub struct UdpSocketState {
     last_send_error: Mutex<Instant>,
+    #[cfg(interface_debug)]
+    interface_binding_logged: std::sync::Once,
     max_gso_segments: AtomicUsize,
 
     /// Whether the underlying Winsock provider supports IPv4 ECN socket options/control messages.
@@ -163,6 +165,8 @@ impl UdpSocketState {
         let now = Instant::now();
         Ok(Self {
             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
+            #[cfg(interface_debug)]
+            interface_binding_logged: std::sync::Once::new(),
             max_gso_segments: AtomicUsize::new(max_gso_segments(&*socket.0)),
             ecn_v4_supported,
             ecn_v6_supported,
@@ -205,12 +209,7 @@ impl UdpSocketState {
     /// instead.
     #[deprecated(note = "silences I/O errors; use `UdpSocketState::try_send() instead")]
     pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(
-            socket,
-            transmit,
-            self.ecn_v4_supported,
-            self.ecn_v6_supported,
-        ) {
+        match self.try_send(socket, transmit) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
             Err(e) => {
@@ -223,6 +222,12 @@ impl UdpSocketState {
 
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
+        #[cfg(interface_debug)]
+        self.interface_binding_logged.call_once(|| {
+            if crate::log::enabled!(crate::log::DEBUG) {
+                log_bound_interface(&socket);
+            }
+        });
         send(
             socket,
             transmit,
@@ -484,6 +489,31 @@ fn send(
     match rc {
         0 => Ok(()),
         _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(interface_debug)]
+fn log_bound_interface(socket: &UdpSockRef<'_>) {
+    let mut interfaces = [None; 2];
+    for (slot, level, option) in [
+        (0, WinSock::IPPROTO_IP, WinSock::IP_UNICAST_IF),
+        (1, WinSock::IPPROTO_IPV6, WinSock::IPV6_UNICAST_IF),
+    ] {
+        // SAFETY: every bit pattern is valid for u32.
+        if let Ok(index) = unsafe { get_socket_option::<u32>(&*socket.0, level, option) }
+            && index != 0
+        {
+            interfaces[slot] = Some(index);
+        }
+    }
+    if interfaces != [None; 2] {
+        debug!(
+            "UDP socket {} ({:?}) has outgoing interface constraints: IPv4={:?}, IPv6={:?}",
+            socket.0.as_raw_socket(),
+            socket.0.local_addr().ok().and_then(|a| a.as_socket()),
+            interfaces[0],
+            interfaces[1],
+        );
     }
 }
 

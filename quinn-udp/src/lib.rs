@@ -71,6 +71,14 @@ mod imp;
 #[allow(unused_imports, unused_macros)]
 mod log {
     #[cfg(all(feature = "log", not(feature = "tracing-log")))]
+    pub(crate) use log::{Level::Debug as DEBUG, log_enabled as enabled};
+
+    #[cfg(feature = "tracing-log")]
+    pub(crate) use tracing::enabled;
+    #[cfg(all(interface_debug, feature = "tracing-log"))]
+    pub(crate) const DEBUG: tracing::Level = tracing::Level::DEBUG;
+
+    #[cfg(all(feature = "log", not(feature = "tracing-log")))]
     pub(crate) use log::{debug, error, info, trace, warn};
 
     #[cfg(feature = "tracing-log")]
